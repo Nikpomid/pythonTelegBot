@@ -4,7 +4,6 @@ from aiogram import Bot, types
 from aiogram.dispatcher import Dispatcher
 from aiogram.types import ParseMode, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.utils import executor
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 # Определяем токен бота и chat_id суперпользователя
 BOT_TOKEN = '2099288144:AAGXadtWRI9BNf5nt87TA4eLFoVtVz50DyE'
@@ -38,34 +37,17 @@ with db:
 # Определяем функцию-обработчик команды /start
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
-    # Получаем пользователя из базы данных
-    user = User.get_or_create(telegram_chat_id=str(message.chat.id))[0]
+    await message.answer("Здравствуйте! Чтобы зарегистрироваться, отправьте следующую информацию:\n"
+                         "Название организации Введите контактную информацию (адрес, телефон, e-mail)")
 
-    if user.approved:
-        await message.answer("Вы уже зарегистрированы.")
-    else:
-        # Отправляем приветственное сообщение при команде /start
-        await message.answer("Здравствуйте! Чтобы зарегистрироваться, отправьте следующую информацию:\n"
-                             "Название организации. Контактная информация (адрес, телефон, e-mail)")
 
-# Создаем InlineKeyboard для кнопок
-registration_keyboard = InlineKeyboardMarkup(row_width=2)
-approve_button = InlineKeyboardButton('Принять', callback_data='approve')
-reject_button = InlineKeyboardButton('Отклонить', callback_data='reject')
-invalid_button = InlineKeyboardButton('Неверный формат', callback_data='invalid')
-registration_keyboard.add(approve_button, reject_button, invalid_button)
-
-# В обработчике сообщения с запросом на регистрацию
+# Определяем функцию-обработчик сообщений
 @dp.message_handler()
 async def process_registration(message: types.Message):
     # Проверяем, есть ли у пользователя запись в базе данных
     user = User.get_or_none(telegram_chat_id=str(message.chat.id))
-    if user is None:
-        # Если запись пользователя не существует,
-        # создаем ее
-        user = User.create(telegram_chat_id=str(message.chat.id))
 
-    if not user.organization_name or not user.contact_info:
+    if not user or not user.organization_name or not user.contact_info:
         # Если запись пользователя не существует, или отсутствует информация об организации или контактах,
         # создаем ее или получаем из базы данных
         user = User.get_or_create(telegram_chat_id=str(message.chat.id))[0]
@@ -80,14 +62,6 @@ async def process_registration(message: types.Message):
             # Отправляем сообщение о том, что запрос на регистрацию отправлен
             await message.reply('Запрос на регистрацию отправлен на рассмотрение Озерцо-логистик')
 
-
-            keyboard = InlineKeyboardMarkup(row_width=2)
-            approve_button = InlineKeyboardButton('Принять', callback_data=f'approve_{user.telegram_chat_id}')
-            reject_button = InlineKeyboardButton('Отклонить', callback_data=f'reject_{user.telegram_chat_id}')
-            wrong_format_button = InlineKeyboardButton('Не верный формат',
-                                                       callback_data=f'wrong_format_{user.telegram_chat_id}')
-            keyboard.add(approve_button, reject_button, wrong_format_button)
-
             # Формируем запрос на регистрацию
             registration_request = (
                 f"Запрос на регистрацию от {user.organization_name}\n"
@@ -95,8 +69,12 @@ async def process_registration(message: types.Message):
                 f"Telegram chat_id: {user.telegram_chat_id}"
             )
 
-            # Отправляем запрос на регистрацию суперпользователю
+            # Отправляем запрос на регистрацию
             if registration_request:
+                keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+                keyboard.add(KeyboardButton('Принять'))
+                keyboard.add(KeyboardButton('Отклонить'))
+                keyboard.add(KeyboardButton('Неверный формат'))
                 await bot.send_message(chat_id=SUPERUSER_CHAT_ID, text=registration_request,
                                        parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
@@ -104,46 +82,32 @@ async def process_registration(message: types.Message):
             await message.reply(
                 'Неверный формат. Введите контактную информацию и название организации, разделив их точкой')
     elif not user.approved:
-        await message.reply('Запрос на регистрацию уже отправлен на рассмотрение Озерцо-логистик')
+        await message.reply('Запрос на регистрацию отправлен на рассмотрение Озерцо-логистик')
 
 
-# Обработчик InlineKeyboardButton "Принять"
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith('approve_'))
-async def process_approve(callback_query: types.CallbackQuery):
-    # Получаем chat_id пользователя из callback_data
-    user_chat_id = callback_query.data.split('_')[1]
-    # Получаем пользователя из базы данных по chat_id
-    user = User.get_or_none(telegram_chat_id=str(user_chat_id))
-    if user:
-        # Устанавливаем флаг approved=True и сохраняем пользователя в базе данных
+
+@dp.callback_query_handler(lambda callback_query: True)
+async def process_callback(callback_query: types.CallbackQuery):
+    # Получаем данные из callback_data
+    data = callback_query.data
+    chat_id = callback_query.message.chat.id
+    user = User.get(telegram_chat_id=str(chat_id))
+
+    if data == 'approve':
+        # Одобряем пользователя
         user.approved = True
         user.save()
-        # Удаляем InlineKeyboard
-        await bot.edit_message_reply_markup(callback_query.message.chat.id, callback_query.message.message_id)
-        # Отправляем сообщение пользователю о том, что его запрос на регистрацию одобрен
-        await bot.send_message(chat_id=user.telegram_chat_id, text='Ваш запрос на регистрацию одобрен')
+        await bot.send_message(chat_id=chat_id, text='Вы были одобрены и зарегистрированы')
+    elif data == 'reject':
+        # Отклоняем пользователя и удаляем запись из базы данных
+        user.delete_instance()
+        await bot.send_message(chat_id=chat_id, text='Ваш запрос на регистрацию был отклонен')
+    elif data == 'wrong_format':
+        # Удаляем пользователя и сообщаем о неверном формате данных
+        user.delete_instance()
+        await bot.send_message(chat_id=chat_id, text='Неверный формат данных. Пожалуйста, зарегистрируйтесь заново')
+        await cmd_start(callback_query.message)
 
-
-# Обработчик InlineKeyboardButton "Отклонить"
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith('reject_'))
-async def process_reject(callback_query: types.CallbackQuery):
-    # Получаем chat_id пользователя из callback_data
-    user_chat_id = callback_query.data.split('_')[1]
-    # Удаляем InlineKeyboard
-    await bot.edit_message_reply_markup(callback_query.message.chat.id, callback_query.message.message_id)
-    # Отправляем сообщение пользователю о том, что его запрос на регистрацию отклонен
-    await bot.send_message(chat_id=user_chat_id, text='Ваш запрос на регистрацию отклонен')
-
-
-# Обработчик InlineKeyboardButton "Неверный формат"
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith('wrong_format_'))
-async def process_wrong_format(callback_query: types.CallbackQuery):
-    # Получаем chat_id пользователя из callback_data
-    user_chat_id = callback_query.data.split('_')[1]
-    # Удаляем InlineKeyboard
-    await bot.edit_message_reply_markup(callback_query.message.chat.id, callback_query.message.message_id)
-    # Отправляем сообщение пользователю о том, что в его запросе на регистрацию был неверный формат
-    await bot.send_message(chat_id=user_chat_id, text='В вашем запросе на регистрацию был неверный формат')
 
 dp.register_message_handler(cmd_start, commands=['start'])
 dp.register_message_handler(process_registration)
