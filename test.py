@@ -16,6 +16,9 @@ import config
 import logging
 from aiogram.types.message import ContentType
 import aiocron
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.dispatcher import FSMContext
+from aiogram.types import Message
 
 # Определяем токен бота и chat_id суперпользователя
 BOT_TOKEN = '2099288144:AAGXadtWRI9BNf5nt87TA4eLFoVtVz50DyE'
@@ -110,8 +113,12 @@ async def successful_payment(message: types.Message):
             user.subscription_end_date = datetime.date.today() + datetime.timedelta(days=30)
         user.subscription_count += 1
         user.save()
+        keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+        keyboard.add(KeyboardButton('/search (Поиск по любому элементу)'))
         await bot.send_message(message.chat.id,
-                               f"Спасибо, что подписались!!! Ваша подписка действительна до {user.subscription_end_date}")
+                               text=f"Спасибо, что подписались!!! "
+                                    f"Ваша подписка действительна до {user.subscription_end_date}",
+                               reply_markup=keyboard)
     else:
         await bot.send_message(message.chat.id,
                                "Вы не являетесь зарегистрированным пользователем или не прошли модерацию.")
@@ -130,8 +137,26 @@ async def send_subscription_reminder(user_id):
                                    reply_markup=markup)
 
 
+@aiocron.crontab('20 16 * * *')  # запускать каждый день в полночь
+async def check_subscriptions():
+    # Получаем всех пользователей из базы данных, кроме суперпользователя
+    users = User.select().where(User.approved == True, User.organization_name != "Superuser")
+    # Проверяем подписки всех пользователей
+    for user in users:
+        if user.is_subscribed and user.subscription_end_date:
+            if user.subscription_end_date < datetime.date.today():
+                user.is_subscribed = False
+                user.subscription_end_date = None
+                user.save()
+                markup = types.InlineKeyboardMarkup()
+                markup.row(types.InlineKeyboardButton("Да", callback_data="subscribe"),
+                           types.InlineKeyboardButton("Нет", callback_data="cancel"))
+                await bot.send_message(user.telegram_chat_id, "Ваша подписка закончилась.Желаете продлить?",
+                                       reply_markup=markup)
+
+
 # Запускаем планировщик задач
-@aiocron.crontab('36 23 * * *')
+@aiocron.crontab('05 16 * * *')
 async def check_subscriptions():
     # Выбираем всех пользователей
     users = User.select().where(User.approved == True)
@@ -140,12 +165,29 @@ async def check_subscriptions():
         await send_subscription_reminder(user.telegram_chat_id)
 
 
-# Обработчик нажатия кнопки "Да"
 @dp.callback_query_handler(lambda c: c.data == 'subscribe')
 async def process_callback_subscribe(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
-    # Отправляем сообщение от имени пользователя
-    await bot.send_message(callback_query.from_user.id, "Нажмите на /buy")
+    user = User.get_or_none(telegram_chat_id=str(callback_query.from_user.id), approved=True)
+    if user:
+        await bot.send_invoice(callback_query.from_user.id,
+                               title="Подписка на бота",
+                               description="Активация подписки на бота на 1 месяц",
+                               provider_token=config.PAYMENTS_TOKEN,
+                               currency="rub",
+                               photo_url="https://www.ozerco.by/img/logo.png",
+                               photo_width=416,
+                               photo_height=234,
+                               photo_size=416,
+                               is_flexible=False,
+                               prices=[PRICE],
+                               start_parameter="one-month-subscription",
+                               payload="test-invoice-payload")
+    else:
+        await bot.send_message(callback_query.from_user.id,
+                               "Вы не являетесь зарегистрированным пользователем или не прошли модерацию.")
+    await bot.edit_message_reply_markup(callback_query.message.chat.id, callback_query.message.message_id,
+                                        reply_markup=None)
 
 
 # Обработчик нажатия кнопки "Нет"
@@ -154,6 +196,8 @@ async def process_callback_cancel(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
     await bot.send_message(callback_query.message.chat.id,
                            "Вы всегда можете продлить/купить подписку через команду /buy")
+    await bot.edit_message_reply_markup(callback_query.message.chat.id, callback_query.message.message_id,
+                                        reply_markup=None)
 
 
 # Определяем хэндлер, который будет реагировать на все текстовые сообщения,
@@ -235,6 +279,137 @@ async def send_excel_table(message: types.Message):
         await message.answer("Вы не являетесь зарегистрированным пользователем или не прошли модерацию.")
 
 
+# Клавиатура для выбора пункта меню
+menu_keyboard = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+menu_keyboard.add(
+    types.KeyboardButton("1 - Краткий номер уведомления"),
+    types.KeyboardButton("2 - Транспортное средство, прицеп"),
+    types.KeyboardButton("3 - Получатель"),
+    types.KeyboardButton("4 - Номер уведомления"),
+    types.KeyboardButton("5 - Регистрационный номер уведомления"),
+    types.KeyboardButton("6 - Разрешение на временное хранение"),
+    types.KeyboardButton("7 - Номер предшествующего свидетельства"),
+    types.KeyboardButton("8 - Книжка МДП"),
+    types.KeyboardButton("9 - INV"),
+    types.KeyboardButton("10 - CMR"),
+    types.KeyboardButton("11 - Выход")
+)
+
+
+SEARCH_FIELDS = {
+    "1 - Краткий номер уведомления": "brief_number",
+    "2 - Транспортное средство, прицеп": "transport",
+    "3 - Получатель": "recipient",
+    "4 - Номер уведомления": "notice_number",
+    "5 - Регистрационный номер уведомления": "registration_number",
+    "6 - Разрешение на временное хранение": "permission",
+    "7 - Номер предшествующего свидетельства": "previous_certificate",
+    "8 - Книжка МДП": "mdp_book",
+    "9 - INV": "inv",
+    "10 - CMR": "cmr"
+}
+
+
+@dp.message_handler(commands=['search'])
+async def search_menu_handler(message: types.Message):
+    # Проверяем, подписан ли пользователь
+    user = User.get_or_none(telegram_chat_id=str(message.from_user.id), approved=True, is_subscribed=True)
+    if user:
+        await bot.send_message(message.chat.id, "Вас приветствует Озерцо-Логистик🔥\n\n❗️Выберите пункт "
+                                                "меню по которому надо найти данные  в ЗТК ❗️",
+                               reply_markup=menu_keyboard)
+    else:
+        await bot.send_message(message.chat.id, "Вы не являетесь подписчиком нашего бота или не прошли модерацию. "
+                                                "Для подписки используйте команду /buy")
+
+
+@dp.message_handler(text="1 - Краткий номер уведомления")
+async def handle_menu_exit(message: types.Message):
+    await message.answer("Введите краткий номер уведомления в формате 'значение':")
+    # регистрируем обработчик
+    dp.register_message_handler(handle_brief_number_response)
+
+
+async def handle_brief_number_response(message: types.Message):
+    brief_number = message.text.strip()
+    conn = sqlite3.connect('data.db')
+    cursor = conn.cursor()
+    # Выполняем запрос в базу данных
+    cursor.execute(f"SELECT number, brief_number, date, transport, recipient, notice_number, "
+                   f"registration_number, permission, previous_certificate, mdp_book, inv, cmr "
+                   f"FROM data WHERE brief_number = ?", (brief_number,))
+    results = cursor.fetchall()
+
+    # Если результатов нет, сообщаем об этом пользователю
+    if not results:
+        await message.answer(f"По номеру {brief_number} ничего не найдено.")
+        conn.close()
+        return
+
+    # Создаем датафрейм из результатов запроса
+    df = pd.DataFrame(results, columns=['Номер', 'Краткий номер', 'Дата', 'Транспорт', 'Получатель',
+                                        'Номер уведомления', 'Рег. номер', 'Разрешение', 'Пред. сертификат',
+                                        'Книга МДП', 'Инв', 'CMR'])
+    # создаем объект io.BytesIO для записи таблицы в формате Excel
+    excel_file = io.BytesIO()
+
+    # создаем объект xlsxwriter и устанавливаем форматирование
+    workbook = xlsxwriter.Workbook(excel_file)
+    worksheet = workbook.add_worksheet()
+    bold = workbook.add_format({'bold': True})
+    worksheet.set_column('A:A', 10)
+    worksheet.set_column('B:B', 20)
+    worksheet.set_column('C:C', 15)
+    worksheet.set_column('D:D', 20)
+    worksheet.set_column('E:E', 20)
+    worksheet.set_column('F:F', 20)
+    worksheet.set_column('G:G', 25)
+    worksheet.set_column('H:H', 20)
+    worksheet.set_column('I:I', 25)
+    worksheet.set_column('J:J', 25)
+    worksheet.set_column('K:K', 20)
+    worksheet.set_column('L:L', 20)
+
+    # заполняем таблицу данными из базы данных
+    row = 0
+    col = 0
+    for header in df.columns:
+        worksheet.write(row, col, header, bold)
+        col += 1
+    for index, row_data in df.iterrows():
+        row += 1
+        col = 0
+        for item in row_data:
+            worksheet.write(row, col, item)
+            col += 1
+
+    # закрываем книгу
+    workbook.close()
+
+    # переводим указатель в начало файла
+    excel_file.seek(0)
+
+    # отправляем файл пользователю
+    excel_file_input = types.InputFile(excel_file, filename='transport_documents.xlsx')
+    await bot.send_document(message.chat.id, excel_file_input, caption='Транспортные документы')
+
+    # закрываем файл
+    excel_file.close()
+
+
+
+
+@dp.message_handler(lambda message: message.text == "11 - Выход")
+async def handle_menu_exit(message: types.Message):
+    # Создаем клавиатуру предыдущего меню
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard.add(KeyboardButton('/search (Поиск по любому элементу в ЗТК)'))
+    await bot.send_message(message.chat.id, "Выход из меню.", reply_markup=keyboard)
+
+
+dp.register_message_handler(handle_brief_number_response, content_types=types.ContentTypes.TEXT)
+
+
 # Определяем функцию-обработчик команды /start
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
@@ -268,7 +443,7 @@ async def cmd_check(message: types.Message):
     # Выбираем всех пользователей
     users = User.select().where(User.approved == True)
     if not users:
-        await message.answer('Зарегестрированных пользователей нет')
+        await message.answer('Зарегистрированных пользователей нет')
     else:
         # Выводим информацию о каждом пользователе
         for user in users:
@@ -403,6 +578,9 @@ async def cmd_check(message: types.Message):
 async def process_registration(message: types.Message):
     # Проверяем, есть ли у пользователя запись в базе данных
     user = User.get_or_none(telegram_chat_id=str(message.chat.id))
+    if message.chat.id == SUPERUSER_CHAT_ID:
+        await message.answer("Суперпользователь не может быть зарегистрирован.")
+        return
     if user is None:
         # Если запись пользователя не существует,
         # создаем ее
@@ -440,7 +618,6 @@ async def process_registration(message: types.Message):
             if registration_request:
                 await bot.send_message(chat_id=SUPERUSER_CHAT_ID, text=registration_request,
                                        parse_mode=ParseMode.HTML, reply_markup=keyboard)
-
         else:
             await message.reply(
                 'Неверный формат. Введите контактную информацию и название организации, разделив их точкой')
