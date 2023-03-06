@@ -17,8 +17,13 @@ import logging
 from aiogram.types.message import ContentType
 import aiocron
 from aiogram.dispatcher.filters.state import State, StatesGroup
-from aiogram.dispatcher import FSMContext
 from aiogram.types import Message
+from enum import Enum
+from aiogram.dispatcher import FSMContext
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher.filters import Command
+from aiogram.dispatcher.middlewares import LifetimeControllerMiddleware
+
 
 # Определяем токен бота и chat_id суперпользователя
 BOT_TOKEN = '2099288144:AAGXadtWRI9BNf5nt87TA4eLFoVtVz50DyE'
@@ -27,9 +32,12 @@ SUPERUSER_CHAT_ID = -1001806118480
 # log
 logging.basicConfig(level=logging.INFO)
 
-# Инициализируем бота и диспетчера
+
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+storage = MemoryStorage()
+dp = Dispatcher(bot, storage=storage)
+
+# Инициализируем бота и диспетчера
 
 # Определяем базу данных
 db_path = os.path.join(os.path.dirname(__file__), 'users.db')
@@ -279,81 +287,111 @@ async def send_excel_table(message: types.Message):
         await message.answer("Вы не являетесь зарегистрированным пользователем или не прошли модерацию.")
 
 
+
 # Клавиатура для выбора пункта меню
 menu_keyboard = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
 menu_keyboard.add(
-    types.KeyboardButton("1 - Краткий номер уведомления"),
-    types.KeyboardButton("2 - Транспортное средство, прицеп"),
-    types.KeyboardButton("3 - Получатель"),
-    types.KeyboardButton("4 - Номер уведомления"),
-    types.KeyboardButton("5 - Регистрационный номер уведомления"),
-    types.KeyboardButton("6 - Разрешение на временное хранение"),
-    types.KeyboardButton("7 - Номер предшествующего свидетельства"),
-    types.KeyboardButton("8 - Книжка МДП"),
-    types.KeyboardButton("9 - INV"),
-    types.KeyboardButton("10 - CMR"),
-    types.KeyboardButton("11 - Выход")
+    types.KeyboardButton("Краткий номер уведомления"),
+    types.KeyboardButton("Транспортное средство, прицеп"),
+    types.KeyboardButton("Получатель"),
+    types.KeyboardButton("Номер уведомления"),
+    types.KeyboardButton("Регистрационный номер уведомления"),
+    types.KeyboardButton("Разрешение на временное хранение"),
+    types.KeyboardButton("Номер предшествующего свидетельства"),
+    types.KeyboardButton("Книжка МДП"),
+    types.KeyboardButton("INV"),
+    types.KeyboardButton("CMR"),
+    types.KeyboardButton("Выход")
 )
 
 
 SEARCH_FIELDS = {
-    "1 - Краткий номер уведомления": "brief_number",
-    "2 - Транспортное средство, прицеп": "transport",
-    "3 - Получатель": "recipient",
-    "4 - Номер уведомления": "notice_number",
-    "5 - Регистрационный номер уведомления": "registration_number",
-    "6 - Разрешение на временное хранение": "permission",
-    "7 - Номер предшествующего свидетельства": "previous_certificate",
-    "8 - Книжка МДП": "mdp_book",
-    "9 - INV": "inv",
-    "10 - CMR": "cmr"
+    'Номер': 'number',
+    'Краткий номер': 'brief_number',
+    'Дата': 'date',
+    'Транспорт': 'transport',
+    'Получатель': 'recipient',
+    'Номер уведомления': 'notice_number',
+    'Рег. номер': 'registration_number',
+    'Разрешение': 'permission',
+    'Пред. сертификат': 'previous_certificate',
+    'Книга МДП': 'mdp_book',
+    'Инв': 'inv',
+    'CMR': 'cmr'
 }
 
 
-@dp.message_handler(commands=['search'])
-async def search_menu_handler(message: types.Message):
-    # Проверяем, подписан ли пользователь
+# Объявляем класс States
+class States(StatesGroup):
+    SEARCH_FIELD = State()
+    SEARCH_VALUE = State()
+
+
+# обработчик команды /search
+@dp.message_handler(Command('search'))
+async def search_menu_handler(message: types.Message, state: FSMContext):
+    await state.finish()  # завершаем предыдущее состояние, если есть
+
+    # проверяем, подписан ли пользователь
     user = User.get_or_none(telegram_chat_id=str(message.from_user.id), approved=True, is_subscribed=True)
+
     if user:
         await bot.send_message(message.chat.id, "Вас приветствует Озерцо-Логистик🔥\n\n❗️Выберите пункт "
                                                 "меню по которому надо найти данные  в ЗТК ❗️",
                                reply_markup=menu_keyboard)
+
+        # устанавливаем состояние пользователя в SEARCH_FIELD
+        await state.update_data(current_state=States.SEARCH_FIELD)
+        print("State updated to SEARCH_FIELD")
+
     else:
         await bot.send_message(message.chat.id, "Вы не являетесь подписчиком нашего бота или не прошли модерацию. "
                                                 "Для подписки используйте команду /buy")
 
 
-@dp.message_handler(text="1 - Краткий номер уведомления")
-async def handle_menu_exit(message: types.Message):
-    await message.answer("Введите краткий номер уведомления в формате 'значение':")
-    # регистрируем обработчик
-    dp.register_message_handler(handle_brief_number_response)
+# обработчик сообщений в состоянии SEARCH_FIELD
+@dp.message_handler(lambda message: message.text in SEARCH_FIELDS.keys(), state=States.SEARCH_FIELD)
+async def handle_search_field(message: types.Message, state: FSMContext):
+    print(f"Received message: {message.text}")
+    field = SEARCH_FIELDS.get(message.text)
+    if field:
+        await message.answer(f"Введите значение для поля '{field}':", reply_markup=types.ReplyKeyboardRemove())
+        async with state.proxy() as data:
+            data['field'] = field
+        await state.update_data(current_state=States.SEARCH_VALUE)
+    else:
+        await message.answer("Выберите одно из полей в меню")
+# Обработчик сообщений в состоянии SEARCH_VALUE
 
 
-async def handle_brief_number_response(message: types.Message):
-    brief_number = message.text.strip()
+@dp.message_handler(state=States.SEARCH_VALUE)
+async def handle_search_value(message: types.Message, state: FSMContext):
+    value = message.text.strip()
+    async with state.proxy() as data:
+        field = data['field']
+    print(f"Получено значение '{value}' для поля '{field}'")
+    # Сохраняем значение поля и переводим пользователя в состояние SEARCH_FIELD
+    async with state.proxy() as data:
+        data[field] = value
+    await States.SEARCH_FIELD.set()
     conn = sqlite3.connect('data.db')
     cursor = conn.cursor()
-    # Выполняем запрос в базу данных
     cursor.execute(f"SELECT number, brief_number, date, transport, recipient, notice_number, "
                    f"registration_number, permission, previous_certificate, mdp_book, inv, cmr "
-                   f"FROM data WHERE brief_number = ?", (brief_number,))
+                   f"FROM data WHERE {field} = ?", (value,))
     results = cursor.fetchall()
 
-    # Если результатов нет, сообщаем об этом пользователю
     if not results:
-        await message.answer(f"По номеру {brief_number} ничего не найдено.")
+        await message.answer(f"Ничего не найдено по запросу '{field} = {value}'.", reply_markup=menu_keyboard)
+
         conn.close()
         return
 
-    # Создаем датафрейм из результатов запроса
     df = pd.DataFrame(results, columns=['Номер', 'Краткий номер', 'Дата', 'Транспорт', 'Получатель',
                                         'Номер уведомления', 'Рег. номер', 'Разрешение', 'Пред. сертификат',
                                         'Книга МДП', 'Инв', 'CMR'])
-    # создаем объект io.BytesIO для записи таблицы в формате Excel
-    excel_file = io.BytesIO()
 
-    # создаем объект xlsxwriter и устанавливаем форматирование
+    excel_file = io.BytesIO()
     workbook = xlsxwriter.Workbook(excel_file)
     worksheet = workbook.add_worksheet()
     bold = workbook.add_format({'bold': True})
@@ -370,7 +408,6 @@ async def handle_brief_number_response(message: types.Message):
     worksheet.set_column('K:K', 20)
     worksheet.set_column('L:L', 20)
 
-    # заполняем таблицу данными из базы данных
     row = 0
     col = 0
     for header in df.columns:
@@ -383,31 +420,23 @@ async def handle_brief_number_response(message: types.Message):
             worksheet.write(row, col, item)
             col += 1
 
-    # закрываем книгу
     workbook.close()
 
-    # переводим указатель в начало файла
     excel_file.seek(0)
 
-    # отправляем файл пользователю
     excel_file_input = types.InputFile(excel_file, filename='transport_documents.xlsx')
     await bot.send_document(message.chat.id, excel_file_input, caption='Транспортные документы')
 
-    # закрываем файл
     excel_file.close()
+    await message.answer("Выберите пункт меню:", reply_markup=menu_keyboard)
 
 
-
-
-@dp.message_handler(lambda message: message.text == "11 - Выход")
+@dp.message_handler(lambda message: message.text == "Выход")
 async def handle_menu_exit(message: types.Message):
     # Создаем клавиатуру предыдущего меню
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
     keyboard.add(KeyboardButton('/search (Поиск по любому элементу в ЗТК)'))
     await bot.send_message(message.chat.id, "Выход из меню.", reply_markup=keyboard)
-
-
-dp.register_message_handler(handle_brief_number_response, content_types=types.ContentTypes.TEXT)
 
 
 # Определяем функцию-обработчик команды /start
@@ -680,6 +709,8 @@ async def process_wrong_format(callback_query: types.CallbackQuery):
 
 dp.register_message_handler(cmd_start, commands=['start'])
 dp.register_message_handler(process_registration)
+
+
 
 # Запускаем бота
 if __name__ == '__main__':
