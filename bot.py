@@ -26,6 +26,8 @@ from aiogram.dispatcher.middlewares import LifetimeControllerMiddleware
 import aiosqlite
 
 
+
+
 # Определяем токен бота и chat_id суперпользователя
 BOT_TOKEN = '2099288144:AAGXadtWRI9BNf5nt87TA4eLFoVtVz50DyE'
 SUPERUSER_CHAT_ID = -1001806118480
@@ -251,6 +253,7 @@ async def process_value(message: Message, state: FSMContext):
     async with state.proxy() as data:
         # Сохраняем введенное значение в переменной value
         data['value'] = message.text
+        field = data.get('field')
 
         # Выполняем поиск данных в базе данных
         async with aiosqlite.connect('data.db') as conn:
@@ -285,6 +288,27 @@ async def process_value(message: Message, state: FSMContext):
                        f"💰📊INV: {row[10]}\n" \
                        f"📜🚛CMR: {row[11]}"
             await message.answer(data_str)
+
+            # Проверяем, что пользователь не подписан на данное значение
+            async with aiosqlite.connect('data.db') as conn:
+                await conn.execute('CREATE TABLE IF NOT EXISTS sub_value (chat_id INTEGER, field TEXT, value TEXT)')
+                await conn.commit()
+
+                cursor = await conn.execute('SELECT 1 FROM sub_value WHERE chat_id = ? AND field = ? AND value = ?',
+                                            (message.chat.id, field, data['value']))
+                row = await cursor.fetchone()
+                if row is not None:
+                    # Значение уже существует для данного пользователя и поля, сообщаем об этом и выходим из функции
+                    await message.answer(
+                        f"Значение '{data['value']}' для поля '{field}' уже существует в базе данных.")
+                    return
+
+                await conn.execute("INSERT INTO sub_value (chat_id, field, value) VALUES (?, ?, ?)",
+                                   (message.chat.id, field, data['value']))
+                await conn.commit()
+
+            # Сообщаем пользователю, что значение успешно сохранено
+            await message.answer(f"Значение '{data['value']}' для поля '{field}' успешно сохранено в базе данных.")
 
         # Сохраняем данные в FSMContext
         await state.finish()
@@ -321,6 +345,10 @@ async def show_subscription_time(message: types.Message):
         keyboard.add(KeyboardButton('/search (Поиск по любому элементу)'))
         await message.answer(f"Ваша подписка действительна еще {remaining_time.days} дней",
                              reply_markup=keyboard)
+
+
+
+
 
 
 dp.register_message_handler(cmd_start, commands=['start'])

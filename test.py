@@ -22,7 +22,7 @@ from enum import Enum
 from aiogram.dispatcher import FSMContext
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher.filters import Command
-from aiogram.dispatcher.middlewares import LifetimeControllerMiddleware
+import aiosqlite
 
 
 # Определяем токен бота и chat_id суперпользователя
@@ -62,6 +62,226 @@ class User(Model):
 with db:
     db.create_tables([User])
 
+
+class RegistrationState(StatesGroup):
+    waiting_for_organization_name = State()
+    waiting_for_contact_info = State()
+
+
+@dp.message_handler(commands=['start'])
+async def cmd_start(message: types.Message, state: FSMContext):
+    # Получаем пользователя из базы данных
+    user = User.get_or_create(telegram_chat_id=str(message.chat.id))[0]
+
+    if user.approved:
+        await message.answer("Вы уже зарегистрированы.")
+    elif user.contact_info:
+        await message.answer("Ваш запрос на регистрацию уже был отправлен и находится на рассмотрении.")
+    else:
+        # Отправляем приветственное сообщение при команде /start
+        await message.answer("Здравствуйте! Чтобы зарегистрироваться, отправьте название организации.")
+
+        # Переходим в состояние ожидания названия организации
+        await RegistrationState.waiting_for_organization_name.set()
+
+
+@dp.message_handler(state=RegistrationState.waiting_for_organization_name)
+async def process_organization_name(message: types.Message, state: FSMContext):
+    # Получаем пользователя из базы данных
+    user = User.get_or_none(telegram_chat_id=str(message.chat.id))
+    if message.chat.id == SUPERUSER_CHAT_ID:
+        await message.answer("Суперпользователь не может быть зарегистрирован.")
+        return
+
+    if user is None:
+        # Если запись пользователя не существует,
+        # создаем ее
+        user = User.create(telegram_chat_id=str(message.chat.id))
+
+    # Сохраняем название организации
+    user.organization_name = message.text
+    user.save()
+
+    # Отправляем сообщение о том, что запрос на регистрацию отправлен
+    await message.reply('Введите контактную информацию.')
+
+    # Переходим в состояние ожидания контактной информации
+    await RegistrationState.waiting_for_contact_info.set()
+
+
+@dp.message_handler(state=RegistrationState.waiting_for_contact_info)
+async def process_contact_info(message: types.Message, state: FSMContext):
+    # Получаем пользователя из базы данных
+    user = User.get_or_none(telegram_chat_id=str(message.chat.id))
+    if user is None:
+        # Если запись пользователя не существует,
+        # создаем ее
+        user = User.create(telegram_chat_id=str(message.chat.id))
+
+    # Сохраняем контактную информацию
+    user.contact_info = message.text
+    user.save()
+
+    # Отправляем сообщение о том, что запрос на регистрацию отправлен
+    await message.reply('Запрос на регистрацию отправлен на рассмотрение Озерцо-логистик')
+
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    approve_button = InlineKeyboardButton('Принять', callback_data=f'approve_{user.telegram_chat_id}')
+    reject_button = InlineKeyboardButton('Отклонить', callback_data=f'reject_{user.telegram_chat_id}')
+    invalid_button = InlineKeyboardButton('Неверный формат', callback_data=f'invalid_{user.telegram_chat_id}')
+    keyboard.add(approve_button, reject_button, invalid_button)
+
+    # Формируем сообщение для администратора
+    message_for_admin = f"Пользователь {user.organization_name} ({user.contact_info}) запрашивает регистрацию."
+    # Отправляем сообщение администратору
+    await bot.send_message(chat_id=SUPERUSER_CHAT_ID, text=message_for_admin, reply_markup=keyboard)
+
+    # Переходим в начальное состояние
+    await state.finish()
+
+
+# Клавиатура для выбора пункта меню
+menu_keyboard = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+menu_keyboard.add(
+    types.KeyboardButton("1 - Краткий номер уведомления"),
+    types.KeyboardButton("2 - Транспортное средство, прицеп"),
+    types.KeyboardButton("3 - Получатель"),
+    types.KeyboardButton("4 - Номер уведомления"),
+    types.KeyboardButton("5 - Регистрационный номер уведомления"),
+    types.KeyboardButton("6 - Разрешение на временное хранение"),
+    types.KeyboardButton("7 - Номер предшествующего свидетельства"),
+    types.KeyboardButton("8 - Книжка МДП"),
+    types.KeyboardButton("9 - INV"),
+    types.KeyboardButton("10 - CMR"),
+    types.KeyboardButton("11 - Выход")
+)
+
+
+menu_to_field = {
+    "1 - Краткий номер уведомления": "brief_number",
+    "2 - Транспортное средство, прицеп": "transport",
+    "3 - Получатель": "recipient",
+    "4 - Номер уведомления": "notice_number",
+    "5 - Регистрационный номер уведомления": "registration_number",
+    "6 - Разрешение на временное хранение": "permission",
+    "7 - Номер предшествующего свидетельства": "previous_certificate",
+    "8 - Книжка МДП": "mdp_book",
+    "9 - INV": "inv",
+    "10 - CMR": "cmr"
+}
+
+
+class SearchStates(StatesGroup):
+    CHOOSING_FIELD = State()
+    ENTERING_VALUE = State()
+
+
+# Определяем хендлер для команды /search, который будет запускать FSM
+@dp.message_handler(commands=['search'], state='*')
+async def search_handler(message: Message):
+    # проверяем, подписан ли пользователь
+    user = User.get_or_none(telegram_chat_id=str(message.from_user.id), approved=True, is_subscribed=True)
+
+    if user:
+        # Запускаем FSM, переводим пользователя в состояние CHOOSING_FIELD
+        await SearchStates.CHOOSING_FIELD.set()
+        await message.answer("Вас приветствует Озерцо-Логистик🔥\n\n"
+                             "❗️Выберите пункт меню по которому надо найти данные  в ЗТК ❗️", reply_markup=menu_keyboard)
+    else:
+        await bot.send_message(message.chat.id, "Вы не являетесь подписчиком нашего бота или не прошли модерацию. "
+                                                "Для подписки используйте команду /buy")
+
+
+# Хендлер для обработки выбора поля из меню
+@dp.message_handler(lambda message: message.text in menu_to_field.keys(), state=SearchStates.CHOOSING_FIELD)
+async def process_field_choice(message: Message, state: FSMContext):
+    async with state.proxy() as data:
+        # Сохраняем выбранное поле в переменной field
+        data['field'] = menu_to_field.get(message.text)
+
+    # Переводим пользователя в состояние ENTERING_VALUE
+    await SearchStates.ENTERING_VALUE.set()
+
+    # Отправляем сообщение с запросом на ввод значения для выбранного поля
+    await message.answer(f"Введите значение для поля '{message.text}':")
+
+
+# Хендлер для обработки введенного значения поля
+@dp.message_handler(state=SearchStates.ENTERING_VALUE)
+async def process_value(message: Message, state: FSMContext):
+    async with state.proxy() as data:
+        # Сохраняем введенное значение в переменной value
+        data['value'] = message.text
+
+        # Выполняем поиск данных в базе данных
+        async with aiosqlite.connect('data.db') as conn:
+            async with conn.execute(f"SELECT number, brief_number, date, transport, recipient, notice_number, "
+                                     f"registration_number, permission, previous_certificate, mdp_book, inv, cmr "
+                                     f"FROM data WHERE {data['field']} = ?", (data['value'],)) as cursor:
+                # Получаем найденные данные
+                rows = await cursor.fetchall()
+
+        # Если ничего не найдено, сообщаем об этом пользователю
+        if not rows:
+            await message.answer("Ничего не найдено.")
+            # Переводим пользователя в состояние CHOOSING_FIELD
+            await SearchStates.CHOOSING_FIELD.set()
+
+            # Отправляем сообщение с меню для нового поиска
+            await message.answer("Выберите пункт меню по которому надо найти данные  в ЗТК", reply_markup=menu_keyboard)
+            return
+
+        # Выводим найденные данные в сообщении пользователю
+        for row in rows:
+            data_str = f"📝Данные по запросу '{message.text}':\n" \
+                       f"📌Краткий номер уведомления: {row[1]}\n" \
+                       f"⏱️Дата: {row[2]}\n" \
+                       f"🚗Транспорт: {row[3]}\n" \
+                       f"📦👤Получатель: {row[4]}\n" \
+                       f"🔢📩Номер уведомления: {row[5]}\n" \
+                       f"📝🔢Регистрационный номер уведомления: {row[6]}\n" \
+                       f"🕒🏭Разрешение на временное хранение: {row[7]}\n" \
+                       f"🔙📜Номер предшествующего свидетельства: {row[8]}\n" \
+                       f"📖🚛Книжка МДП: {row[9]}\n" \
+                       f"💰📊INV: {row[10]}\n" \
+                       f"📜🚛CMR: {row[11]}"
+            await message.answer(data_str)
+
+        # Сохраняем данные в FSMContext
+        await state.finish()
+
+        # Переводим пользователя в состояние CHOOSING_FIELD
+        await SearchStates.CHOOSING_FIELD.set()
+
+        # Отправляем сообщение с меню для нового поиска
+        await message.answer("Выберите пункт меню по которому надо найти данные  в ЗТК", reply_markup=menu_keyboard)
+
+
+@dp.message_handler(lambda message: message.text == "11 - Выход",
+                    state=[SearchStates.CHOOSING_FIELD, SearchStates.ENTERING_VALUE, 'search'])
+async def handle_search_exit(message: types.Message, state: FSMContext):
+    # Очищаем FSMContext
+    await state.finish()
+
+    # Создаем клавиатуру предыдущего меню
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard.add(KeyboardButton('/time (Оставшейся время подписки)'))
+    keyboard.add(KeyboardButton('/search (Поиск по любому элементу в ЗТК)'))
+
+    # Отправляем сообщение о выходе
+    await bot.send_message(message.chat.id, "Выход из меню.", reply_markup=keyboard)
+
+
+@dp.message_handler(Command("time"))
+async def show_subscription_time(message: types.Message):
+    user = User.get_or_none(telegram_chat_id=str(message.chat.id), approved=True, is_subscribed=True)
+    if user:
+        remaining_time = user.subscription_end_date - datetime.date.today()
+        keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+        keyboard.add(KeyboardButton('/time (Оставшейся время подписки)'))
+        keyboard.add(KeyboardButton('/search (Поиск по любому элементу)'))
+        await message.answer(f"Ваша подписка действительна еще {remaining_time.days} дней",
+                             reply_markup=keyboard)
 
 # prices
 PRICE = types.LabeledPrice(label="Подписка на 1 месяц", amount=500 * 100)  # в копейках (руб)
@@ -122,6 +342,7 @@ async def successful_payment(message: types.Message):
         user.subscription_count += 1
         user.save()
         keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+        keyboard.add(KeyboardButton('/time (Оставшейся время подписки)'))
         keyboard.add(KeyboardButton('/search (Поиск по любому элементу)'))
         await bot.send_message(message.chat.id,
                                text=f"Спасибо, что подписались!!! "
@@ -208,6 +429,17 @@ async def process_callback_cancel(callback_query: types.CallbackQuery):
                                         reply_markup=None)
 
 
+@dp.message_handler(Command("time"))
+async def show_subscription_time(message: types.Message):
+    user = User.get_or_none(telegram_chat_id=str(message.chat.id), approved=True, is_subscribed=True)
+    if user:
+        remaining_time = user.subscription_end_date - datetime.date.today()
+        keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+        keyboard.add(KeyboardButton('/search (Поиск по любому элементу)'))
+        await message.answer(f"Ваша подписка действительна еще {remaining_time.days} дней",
+                             reply_markup=keyboard)
+
+
 # Определяем хэндлер, который будет реагировать на все текстовые сообщения,
 # не являющиеся командами ПРОВЕРИТЬ !!!!!!
 @dp.message_handler(Text(equals="", ignore_case=True))
@@ -285,172 +517,6 @@ async def send_excel_table(message: types.Message):
         excel_file.close()
     else:
         await message.answer("Вы не являетесь зарегистрированным пользователем или не прошли модерацию.")
-
-
-
-# Клавиатура для выбора пункта меню
-menu_keyboard = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
-menu_keyboard.add(
-    types.KeyboardButton("Краткий номер уведомления"),
-    types.KeyboardButton("Транспортное средство, прицеп"),
-    types.KeyboardButton("Получатель"),
-    types.KeyboardButton("Номер уведомления"),
-    types.KeyboardButton("Регистрационный номер уведомления"),
-    types.KeyboardButton("Разрешение на временное хранение"),
-    types.KeyboardButton("Номер предшествующего свидетельства"),
-    types.KeyboardButton("Книжка МДП"),
-    types.KeyboardButton("INV"),
-    types.KeyboardButton("CMR"),
-    types.KeyboardButton("Выход")
-)
-
-
-SEARCH_FIELDS = {
-    'Номер': 'number',
-    'Краткий номер': 'brief_number',
-    'Дата': 'date',
-    'Транспорт': 'transport',
-    'Получатель': 'recipient',
-    'Номер уведомления': 'notice_number',
-    'Рег. номер': 'registration_number',
-    'Разрешение': 'permission',
-    'Пред. сертификат': 'previous_certificate',
-    'Книга МДП': 'mdp_book',
-    'Инв': 'inv',
-    'CMR': 'cmr'
-}
-
-
-# Объявляем класс States
-class States(StatesGroup):
-    SEARCH_FIELD = State()
-    SEARCH_VALUE = State()
-
-
-# обработчик команды /search
-@dp.message_handler(Command('search'))
-async def search_menu_handler(message: types.Message, state: FSMContext):
-    await state.finish()  # завершаем предыдущее состояние, если есть
-
-    # проверяем, подписан ли пользователь
-    user = User.get_or_none(telegram_chat_id=str(message.from_user.id), approved=True, is_subscribed=True)
-
-    if user:
-        await bot.send_message(message.chat.id, "Вас приветствует Озерцо-Логистик🔥\n\n❗️Выберите пункт "
-                                                "меню по которому надо найти данные  в ЗТК ❗️",
-                               reply_markup=menu_keyboard)
-
-        # устанавливаем состояние пользователя в SEARCH_FIELD
-        await state.update_data(current_state=States.SEARCH_FIELD)
-        print("State updated to SEARCH_FIELD")
-
-    else:
-        await bot.send_message(message.chat.id, "Вы не являетесь подписчиком нашего бота или не прошли модерацию. "
-                                                "Для подписки используйте команду /buy")
-
-
-# обработчик сообщений в состоянии SEARCH_FIELD
-@dp.message_handler(lambda message: message.text in SEARCH_FIELDS.keys(), state=States.SEARCH_FIELD)
-async def handle_search_field(message: types.Message, state: FSMContext):
-    print(f"Received message: {message.text}")
-    field = SEARCH_FIELDS.get(message.text)
-    if field:
-        await message.answer(f"Введите значение для поля '{field}':", reply_markup=types.ReplyKeyboardRemove())
-        async with state.proxy() as data:
-            data['field'] = field
-        await state.update_data(current_state=States.SEARCH_VALUE)
-    else:
-        await message.answer("Выберите одно из полей в меню")
-# Обработчик сообщений в состоянии SEARCH_VALUE
-
-
-@dp.message_handler(state=States.SEARCH_VALUE)
-async def handle_search_value(message: types.Message, state: FSMContext):
-    value = message.text.strip()
-    async with state.proxy() as data:
-        field = data['field']
-    print(f"Получено значение '{value}' для поля '{field}'")
-    # Сохраняем значение поля и переводим пользователя в состояние SEARCH_FIELD
-    async with state.proxy() as data:
-        data[field] = value
-    await States.SEARCH_FIELD.set()
-    conn = sqlite3.connect('data.db')
-    cursor = conn.cursor()
-    cursor.execute(f"SELECT number, brief_number, date, transport, recipient, notice_number, "
-                   f"registration_number, permission, previous_certificate, mdp_book, inv, cmr "
-                   f"FROM data WHERE {field} = ?", (value,))
-    results = cursor.fetchall()
-
-    if not results:
-        await message.answer(f"Ничего не найдено по запросу '{field} = {value}'.", reply_markup=menu_keyboard)
-
-        conn.close()
-        return
-
-    df = pd.DataFrame(results, columns=['Номер', 'Краткий номер', 'Дата', 'Транспорт', 'Получатель',
-                                        'Номер уведомления', 'Рег. номер', 'Разрешение', 'Пред. сертификат',
-                                        'Книга МДП', 'Инв', 'CMR'])
-
-    excel_file = io.BytesIO()
-    workbook = xlsxwriter.Workbook(excel_file)
-    worksheet = workbook.add_worksheet()
-    bold = workbook.add_format({'bold': True})
-    worksheet.set_column('A:A', 10)
-    worksheet.set_column('B:B', 20)
-    worksheet.set_column('C:C', 15)
-    worksheet.set_column('D:D', 20)
-    worksheet.set_column('E:E', 20)
-    worksheet.set_column('F:F', 20)
-    worksheet.set_column('G:G', 25)
-    worksheet.set_column('H:H', 20)
-    worksheet.set_column('I:I', 25)
-    worksheet.set_column('J:J', 25)
-    worksheet.set_column('K:K', 20)
-    worksheet.set_column('L:L', 20)
-
-    row = 0
-    col = 0
-    for header in df.columns:
-        worksheet.write(row, col, header, bold)
-        col += 1
-    for index, row_data in df.iterrows():
-        row += 1
-        col = 0
-        for item in row_data:
-            worksheet.write(row, col, item)
-            col += 1
-
-    workbook.close()
-
-    excel_file.seek(0)
-
-    excel_file_input = types.InputFile(excel_file, filename='transport_documents.xlsx')
-    await bot.send_document(message.chat.id, excel_file_input, caption='Транспортные документы')
-
-    excel_file.close()
-    await message.answer("Выберите пункт меню:", reply_markup=menu_keyboard)
-
-
-@dp.message_handler(lambda message: message.text == "Выход")
-async def handle_menu_exit(message: types.Message):
-    # Создаем клавиатуру предыдущего меню
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
-    keyboard.add(KeyboardButton('/search (Поиск по любому элементу в ЗТК)'))
-    await bot.send_message(message.chat.id, "Выход из меню.", reply_markup=keyboard)
-
-
-# Определяем функцию-обработчик команды /start
-@dp.message_handler(commands=['start'])
-async def cmd_start(message: types.Message):
-    # Получаем пользователя из базы данных
-    user = User.get_or_create(telegram_chat_id=str(message.chat.id))[0]
-
-    if user.approved:
-        await message.answer("Вы уже зарегистрированы.")
-    else:
-        # Отправляем приветственное сообщение при команде /start
-        await message.answer("Здравствуйте! Чтобы зарегистрироваться, отправьте следующую информацию:\n"
-                             "Название организации. Контактная информация (адрес, телефон, e-mail)")
 
 
 # Определяем функцию для удаления пользователя
@@ -602,58 +668,6 @@ async def cmd_check(message: types.Message):
                                        parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 
-# В обработчике сообщения с запросом на регистрацию
-@dp.message_handler()
-async def process_registration(message: types.Message):
-    # Проверяем, есть ли у пользователя запись в базе данных
-    user = User.get_or_none(telegram_chat_id=str(message.chat.id))
-    if message.chat.id == SUPERUSER_CHAT_ID:
-        await message.answer("Суперпользователь не может быть зарегистрирован.")
-        return
-    if user is None:
-        # Если запись пользователя не существует,
-        # создаем ее
-        user = User.create(telegram_chat_id=str(message.chat.id))
-
-    if not user.organization_name or not user.contact_info:
-        # Если запись пользователя не существует, или отсутствует информация об организации или контактах,
-        # создаем ее или получаем из базы данных
-        user = User.get_or_create(telegram_chat_id=str(message.chat.id))[0]
-
-        # Если отсутствует информация об организации или контактах,
-        # запрашиваем название организации и контактную информацию
-        parts = message.text.split('.')
-        if len(parts) >= 2:
-            user.organization_name = parts[0].strip()
-            user.contact_info = '.'.join(parts[1:]).strip()
-            user.save()
-            # Отправляем сообщение о том, что запрос на регистрацию отправлен
-            await message.reply('Запрос на регистрацию отправлен на рассмотрение Озерцо-логистик')
-
-            keyboard = InlineKeyboardMarkup(row_width=2)
-            approve_button = InlineKeyboardButton('Принять', callback_data=f'approve_{user.telegram_chat_id}')
-            reject_button = InlineKeyboardButton('Отклонить', callback_data=f'reject_{user.telegram_chat_id}')
-            invalid_button = InlineKeyboardButton('Неверный формат', callback_data=f'invalid_{user.telegram_chat_id}')
-            keyboard.add(approve_button, reject_button, invalid_button)
-
-            # Формируем запрос на регистрацию
-            registration_request = (
-                f"Запрос на регистрацию от {user.organization_name}\n"
-                f"Контактная информация: {user.contact_info}\n"
-                f"Telegram chat_id: {user.telegram_chat_id}"
-            )
-
-            # Отправляем запрос на регистрацию суперпользователю
-            if registration_request:
-                await bot.send_message(chat_id=SUPERUSER_CHAT_ID, text=registration_request,
-                                       parse_mode=ParseMode.HTML, reply_markup=keyboard)
-        else:
-            await message.reply(
-                'Неверный формат. Введите контактную информацию и название организации, разделив их точкой')
-    elif not user.approved:
-        await message.reply('Запрос на регистрацию уже отправлен на рассмотрение Озерцо-логистик')
-
-
 # Обработчик InlineKeyboardButton "Принять"
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('approve_'))
 async def process_approve(callback_query: types.CallbackQuery):
@@ -708,8 +722,6 @@ async def process_wrong_format(callback_query: types.CallbackQuery):
 
 
 dp.register_message_handler(cmd_start, commands=['start'])
-dp.register_message_handler(process_registration)
-
 
 
 # Запускаем бота

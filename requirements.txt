@@ -1,0 +1,7 @@
+aiogram
+pandas
+xlsxwriter
+peewee
+sqlite3
+aiocron
+aiosqlite
